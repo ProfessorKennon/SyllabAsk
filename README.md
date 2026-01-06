@@ -1,1 +1,578 @@
 # SyllabAsk
+import React, { useState, useRef } from 'react';
+import { MessageSquare, BookOpen, Sparkles, Send, Loader2, CheckCircle, AlertCircle, Upload } from 'lucide-react';
+
+export default function SyllabusQA() {
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [syllabusContent, setSyllabusContent] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [isReady, setIsReady] = useState(false);
+  const [debugLog, setDebugLog] = useState([]);
+  
+  const [chatMessages, setChatMessages] = useState([]);
+  const [currentQuestion, setCurrentQuestion] = useState('');
+  const [isAsking, setIsAsking] = useState(false);
+  
+  const fileInputRef = useRef(null);
+
+  const addDebugLog = (message) => {
+    console.log(message);
+    setDebugLog(prev => [...prev, `${new Date().toLocaleTimeString()}: ${message}`]);
+  };
+
+  // Load syllabus from uploaded file
+  const handleFileSelect = async (event) => {
+    addDebugLog('handleFileSelect called');
+    
+    const file = event.target.files?.[0];
+    if (!file) {
+      addDebugLog('No file in event.target.files');
+      return;
+    }
+    
+    addDebugLog(`File selected: ${file.name}, Type: ${file.type}, Size: ${file.size} bytes`);
+    setSelectedFile(file);
+    setIsLoading(true);
+    setLoadError('');
+    setIsReady(false);
+    setChatMessages([]);
+    
+    try {
+      let content = '';
+      
+      if (file.type === 'application/pdf') {
+        addDebugLog('Processing PDF...');
+        
+        // Load PDF.js library
+        if (!window.pdfjsLib) {
+          addDebugLog('Loading PDF.js library...');
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+          document.head.appendChild(script);
+          
+          await new Promise((resolve, reject) => {
+            script.onload = resolve;
+            script.onerror = reject;
+          });
+          
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          addDebugLog('PDF.js loaded');
+        }
+        
+        // Read PDF and extract text
+        const arrayBuffer = await file.arrayBuffer();
+        addDebugLog(`PDF loaded as ArrayBuffer (${arrayBuffer.byteLength} bytes)`);
+        
+        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        addDebugLog(`PDF has ${pdf.numPages} pages`);
+        
+        let fullText = '';
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map(item => item.str).join(' ');
+          fullText += pageText + '\n\n';
+          addDebugLog(`Extracted page ${i}/${pdf.numPages}`);
+        }
+        
+        content = fullText.trim();
+        addDebugLog(`Extracted ${content.length} chars of text from PDF`);
+        
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || 
+                 file.type === 'application/msword') {
+        addDebugLog('Processing Word document...');
+        
+        // Load mammoth library if not already loaded
+        if (!window.mammoth) {
+          addDebugLog('Loading mammoth library...');
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js';
+          document.head.appendChild(script);
+          
+          await new Promise((resolve, reject) => {
+            script.onload = resolve;
+            script.onerror = reject;
+          });
+          addDebugLog('Mammoth loaded');
+        }
+        
+        const arrayBuffer = await file.arrayBuffer();
+        addDebugLog(`Word doc loaded as ArrayBuffer (${arrayBuffer.byteLength} bytes)`);
+        
+        const result = await window.mammoth.extractRawText({ arrayBuffer });
+        content = result.value;
+        addDebugLog(`Extracted ${content.length} chars of text from Word doc`);
+        
+      } else {
+        addDebugLog('Processing text file...');
+        const text = await file.text();
+        
+        if (file.type === 'text/html' || file.name.endsWith('.html')) {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(text, 'text/html');
+          doc.querySelectorAll('script, style, nav, footer, header').forEach(el => el.remove());
+          content = doc.body.textContent || doc.body.innerText || '';
+          content = content.replace(/\s+/g, ' ').trim();
+        } else {
+          content = text;
+        }
+      }
+      
+      addDebugLog(`Content extracted, length: ${content.length}`);
+      
+      if (!content || content.length < 50) {
+        throw new Error('File appears to be empty or invalid');
+      }
+      
+      setSyllabusContent(content);
+      setIsReady(true);
+      addDebugLog('Syllabus ready!');
+      
+      setChatMessages([{
+        role: 'assistant',
+        content: "✅ Syllabus loaded successfully! I've read through the entire document. Ask me anything about:\n\n• Course policies\n• Grading and assignments\n• Schedule and deadlines\n• Required materials\n• Office hours\n• Or anything else in the syllabus!"
+      }]);
+      
+    } catch (error) {
+      addDebugLog(`Error: ${error.message}`);
+      console.error('Error loading syllabus:', error);
+      setLoadError(error.message || 'Failed to load syllabus. Please try a different file.');
+    } finally {
+      setIsLoading(false);
+      addDebugLog('Loading complete');
+    }
+  };
+
+  const handleButtonClick = () => {
+    addDebugLog('Upload button clicked');
+    fileInputRef.current?.click();
+  };
+
+  // Ask AI a question about the syllabus
+  const handleAskQuestion = async (e) => {
+    e.preventDefault();
+    if (!currentQuestion.trim() || isAsking) return;
+    
+    const userMessage = currentQuestion;
+    setCurrentQuestion('');
+    setIsAsking(true);
+    
+    const newMessages = [...chatMessages, { role: 'user', content: userMessage }];
+    setChatMessages(newMessages);
+    
+    // Retry logic
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (attempts < maxAttempts) {
+      attempts++;
+      addDebugLog(`Attempt ${attempts}/${maxAttempts}`);
+      
+      try {
+        addDebugLog(`Sending text to AI (${syllabusContent.length} chars)`);
+        
+        // Use XMLHttpRequest instead of fetch to avoid "body locked" issues
+        const requestData = JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          messages: [
+            {
+              role: 'user',
+              content: `Here is a course syllabus:\n\n${syllabusContent}\n\n---\n\nStudent question: ${userMessage}\n\nPlease answer this question based on the syllabus. Be helpful and specific. If the information isn't in the syllabus, let the student know.`
+            }
+          ]
+        });
+        
+        addDebugLog('Creating XHR request...');
+        
+        const data = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          
+          // Set timeout
+          xhr.timeout = 30000;
+          xhr.ontimeout = () => {
+            addDebugLog('XHR timeout');
+            reject(new Error('Request timeout'));
+          };
+          
+          xhr.onload = () => {
+            addDebugLog(`XHR complete: status=${xhr.status}`);
+            
+            if (xhr.status !== 200) {
+              addDebugLog(`XHR error: ${xhr.responseText.substring(0, 300)}`);
+              reject(new Error(`API returned ${xhr.status}`));
+              return;
+            }
+            
+            try {
+              addDebugLog(`Response text length: ${xhr.responseText.length}`);
+              addDebugLog(`Response preview: ${xhr.responseText.substring(0, 100)}`);
+              
+              const jsonData = JSON.parse(xhr.responseText);
+              addDebugLog(`JSON parsed! Keys: ${Object.keys(jsonData).join(', ')}`);
+              resolve(jsonData);
+            } catch (parseError) {
+              addDebugLog(`Parse error: ${parseError.message}`);
+              addDebugLog(`Raw response: ${xhr.responseText.substring(0, 500)}`);
+              reject(parseError);
+            }
+          };
+          
+          xhr.onerror = () => {
+            addDebugLog('XHR network error');
+            reject(new Error('Network error'));
+          };
+          
+          xhr.open('POST', 'https://api.anthropic.com/v1/messages');
+          xhr.setRequestHeader('Content-Type', 'application/json');
+          addDebugLog('Sending XHR...');
+          xhr.send(requestData);
+        });
+        
+        addDebugLog(`Response keys: ${Object.keys(data).join(', ')}`);
+        
+        if (!data.content) {
+          addDebugLog(`No 'content' property! Full data: ${JSON.stringify(data).substring(0, 500)}`);
+          throw new Error('API response missing content property');
+        }
+        
+        if (!Array.isArray(data.content)) {
+          addDebugLog(`Content is not array! Type: ${typeof data.content}`);
+          throw new Error('API content is not an array');
+        }
+        
+        if (data.content.length === 0) {
+          addDebugLog(`Content array is empty!`);
+          throw new Error('API returned empty content array');
+        }
+        
+        addDebugLog(`Content has ${data.content.length} blocks`);
+        data.content.forEach((block, i) => {
+          addDebugLog(`Block ${i}: type=${block.type}, hasText=${!!block.text}, textLength=${block.text?.length || 0}`);
+        });
+        
+        const textBlocks = data.content.filter(block => block && block.type === 'text');
+        addDebugLog(`Found ${textBlocks.length} text blocks`);
+        
+        const aiResponse = textBlocks
+          .map(block => block.text || '')
+          .filter(text => text.length > 0)
+          .join('\n');
+        
+        if (!aiResponse || aiResponse.trim().length === 0) {
+          addDebugLog(`No text extracted! Blocks: ${JSON.stringify(data.content).substring(0, 500)}`);
+          throw new Error('No text content in response');
+        }
+        
+        addDebugLog(`Success! Extracted ${aiResponse.length} chars`);
+        setChatMessages([...newMessages, { role: 'assistant', content: aiResponse }]);
+        return; // Success, exit retry loop
+        
+      } catch (error) {
+        addDebugLog(`Attempt ${attempts} error: ${error.message}`);
+        
+        if (error.name === 'AbortError') {
+          addDebugLog('Request was aborted/timed out');
+        }
+        
+        if (attempts >= maxAttempts) {
+          addDebugLog(`All ${maxAttempts} attempts failed`);
+          console.error('Full error:', error);
+          setChatMessages([...newMessages, { 
+            role: 'assistant', 
+            content: `❌ Error after ${maxAttempts} attempts: ${error.message}\n\nThis might be due to:\n• File too large (${Math.round(syllabusContent.length / 1024)}KB)\n• Network timeout\n• Connection issue\n\nTry asking a simpler question or upload a smaller file.` 
+          }]);
+        } else {
+          addDebugLog('Waiting before retry...');
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+        }
+      }
+    }
+    
+    setIsAsking(false);
+  };
+
+  const suggestedQuestions = [
+    "What's the grading breakdown?",
+    "When are assignments due?",
+    "What's the attendance policy?",
+    "What materials do I need?",
+    "How do I contact the professor?",
+    "What's the late work policy?"
+  ];
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-indigo-900">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        * {
+          font-family: 'Inter', sans-serif;
+        }
+        
+        h1, h2, .heading {
+          font-family: 'Playfair Display', serif;
+        }
+        
+        .glow {
+          box-shadow: 0 0 20px rgba(99, 102, 241, 0.3);
+        }
+        
+        .chat-message {
+          animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        
+        @keyframes slideUp {
+          from {
+            opacity: 0;
+            transform: translateY(20px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        
+        .pulse-dot {
+          animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        
+        @keyframes pulse {
+          0%, 100% {
+            opacity: 1;
+            transform: scale(1);
+          }
+          50% {
+            opacity: 0.5;
+            transform: scale(0.8);
+          }
+        }
+      `}</style>
+
+      {/* Header */}
+      <div className="bg-gradient-to-r from-indigo-600 via-purple-600 to-blue-600 text-white py-20 px-6 shadow-2xl">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center gap-4 mb-6">
+            <div className="bg-white/20 p-4 rounded-2xl backdrop-blur-sm glow">
+              <BookOpen size={48} strokeWidth={2} />
+            </div>
+            <div>
+              <h1 className="text-6xl font-black tracking-tight mb-2">Syllabus AI</h1>
+              <p className="text-2xl text-indigo-100 font-light">Your intelligent course companion</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-4xl mx-auto px-6 py-12">
+        {/* Load Syllabus Section */}
+        {!isReady && (
+          <div className="bg-white/10 backdrop-blur-sm rounded-3xl p-8 mb-8 border-2 border-indigo-400/30">
+            <div className="flex items-center gap-3 mb-6">
+              <Upload className="text-indigo-400" size={32} strokeWidth={2.5} />
+              <h2 className="text-3xl font-bold text-white">Upload Your Syllabus</h2>
+            </div>
+            
+            <p className="text-gray-300 mb-6 leading-relaxed">
+              Upload your course syllabus file (PDF, Word, or text). The AI will read it and answer any questions students have.
+            </p>
+            
+            <div className="space-y-4">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.doc,.docx,.txt,.html"
+                onChange={handleFileSelect}
+                style={{ display: 'none' }}
+              />
+              
+              <button
+                onClick={handleButtonClick}
+                disabled={isLoading}
+                className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white py-6 rounded-xl font-bold text-lg shadow-2xl hover:shadow-indigo-500/50 hover:from-indigo-700 hover:to-purple-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
+              >
+                {isLoading ? (
+                  <>
+                    <Loader2 className="animate-spin" size={28} />
+                    Processing {selectedFile?.name}...
+                  </>
+                ) : selectedFile && !isReady ? (
+                  <>
+                    <CheckCircle size={28} />
+                    {selectedFile.name} - Processing...
+                  </>
+                ) : (
+                  <>
+                    <Upload size={28} />
+                    Click to Select Syllabus File
+                  </>
+                )}
+              </button>
+              
+              {selectedFile && !isLoading && !isReady && (
+                <div className="text-center text-gray-300">
+                  Selected: {selectedFile.name}
+                </div>
+              )}
+              
+              {loadError && (
+                <div className="flex items-start gap-3 p-4 bg-red-500/20 border border-red-500/50 rounded-xl">
+                  <AlertCircle className="text-red-400 flex-shrink-0 mt-0.5" size={20} />
+                  <p className="text-red-200 text-sm">{loadError}</p>
+                </div>
+              )}
+            </div>
+            
+            <div className="mt-8 pt-8 border-t border-white/10">
+              <p className="text-gray-400 text-sm mb-3 font-semibold">💡 Supported Formats:</p>
+              <div className="flex flex-wrap gap-2">
+                <span className="px-3 py-1 bg-white/5 rounded-lg text-gray-300 text-sm border border-white/10">PDF (.pdf)</span>
+                <span className="px-3 py-1 bg-white/5 rounded-lg text-gray-300 text-sm border border-white/10">Word (.doc, .docx)</span>
+                <span className="px-3 py-1 bg-white/5 rounded-lg text-gray-300 text-sm border border-white/10">Text (.txt)</span>
+                <span className="px-3 py-1 bg-white/5 rounded-lg text-gray-300 text-sm border border-white/10">HTML (.html)</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Chat Interface */}
+        {isReady && (
+          <div className="space-y-6">
+            {/* Status Card */}
+            <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-6 border-2 border-green-400/30">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <CheckCircle className="text-green-400" size={28} />
+                  <div>
+                    <h3 className="text-xl font-bold text-white">Syllabus Ready: {selectedFile?.name}</h3>
+                    <p className="text-gray-400 text-sm">Ask me anything about the course</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setIsReady(false);
+                    setSelectedFile(null);
+                    setSyllabusContent('');
+                    setChatMessages([]);
+                    setDebugLog([]);
+                  }}
+                  className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm font-medium text-white transition-colors border border-white/20"
+                >
+                  Upload Different File
+                </button>
+              </div>
+            </div>
+
+            {/* Chat Messages */}
+            <div className="bg-white/10 backdrop-blur-sm rounded-3xl overflow-hidden border-2 border-indigo-400/30">
+              <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-6">
+                <div className="flex items-center gap-3">
+                  <div className="bg-white/20 p-3 rounded-xl backdrop-blur-sm">
+                    <MessageSquare size={28} strokeWidth={2} />
+                  </div>
+                  <div>
+                    <h3 className="text-2xl font-bold text-white">AI Assistant</h3>
+                    <p className="text-indigo-100">Powered by Claude</p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="p-6 space-y-4 max-h-[500px] overflow-y-auto bg-gradient-to-b from-slate-900/50 to-slate-900/80">
+                {chatMessages.map((message, index) => (
+                  <div
+                    key={index}
+                    className={`chat-message flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[85%] p-5 rounded-2xl ${
+                        message.role === 'user'
+                          ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-xl'
+                          : 'bg-white/10 backdrop-blur-sm text-white border border-white/20'
+                      }`}
+                    >
+                      <div className="whitespace-pre-wrap leading-relaxed">{message.content}</div>
+                    </div>
+                  </div>
+                ))}
+                
+                {isAsking && (
+                  <div className="flex justify-start">
+                    <div className="bg-white/10 backdrop-blur-sm p-5 rounded-2xl border border-white/20">
+                      <div className="flex gap-2">
+                        <div className="w-2.5 h-2.5 bg-indigo-400 rounded-full pulse-dot"></div>
+                        <div className="w-2.5 h-2.5 bg-purple-400 rounded-full pulse-dot" style={{animationDelay: '0.2s'}}></div>
+                        <div className="w-2.5 h-2.5 bg-blue-400 rounded-full pulse-dot" style={{animationDelay: '0.4s'}}></div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              
+              {/* Suggested Questions */}
+              {chatMessages.length === 1 && (
+                <div className="px-6 pb-4 bg-gradient-to-b from-slate-900/80 to-slate-900">
+                  <p className="text-gray-400 text-sm font-semibold mb-3">✨ Quick Questions:</p>
+                  <div className="flex flex-wrap gap-2">
+                    {suggestedQuestions.map((q, i) => (
+                      <button
+                        key={i}
+                        onClick={() => setCurrentQuestion(q)}
+                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-gray-300 text-sm transition-colors border border-white/10 hover:border-indigo-400/50"
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* Input Form */}
+              <form onSubmit={handleAskQuestion} className="p-6 border-t border-white/10 bg-slate-900/80">
+                <div className="flex gap-3">
+                  <input
+                    type="text"
+                    value={currentQuestion}
+                    onChange={(e) => setCurrentQuestion(e.target.value)}
+                    placeholder="Ask about grades, deadlines, policies..."
+                    className="flex-1 px-5 py-4 bg-white/10 backdrop-blur-sm border-2 border-indigo-400/30 rounded-xl text-white placeholder-gray-400 focus:border-indigo-400 focus:outline-none transition-all"
+                    disabled={isAsking}
+                  />
+                  <button
+                    type="submit"
+                    disabled={isAsking || !currentQuestion.trim()}
+                    className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-8 py-4 rounded-xl font-bold shadow-xl hover:shadow-indigo-500/50 hover:from-indigo-700 hover:to-purple-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 glow"
+                  >
+                    <Send size={20} />
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
+      
+      {/* Always-visible Debug Log */}
+      {debugLog.length > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 bg-black/95 border-t-2 border-indigo-500 p-4 max-h-48 overflow-y-auto backdrop-blur-sm z-50">
+          <div className="max-w-4xl mx-auto">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-indigo-400 text-xs font-semibold">📊 Debug Log (Real-time)</p>
+              <button
+                onClick={() => setDebugLog([])}
+                className="text-gray-400 hover:text-white text-xs"
+              >
+                Clear
+              </button>
+            </div>
+            <div className="space-y-1">
+              {debugLog.slice(-10).map((log, i) => (
+                <p key={i} className="text-xs text-gray-300 font-mono">{log}</p>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
